@@ -512,6 +512,68 @@ async fn test_fuzzy_file_search_session_multiple_query_updates_work() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuzzy_file_search_session_burst_updates_publish_final_query() -> Result<()> {
+    const BURST_COUNT: usize = 4;
+    const FILE_COUNT: usize = 4_096;
+    const PREFIX_COUNT: usize = 32;
+
+    let codex_home = TempDir::new()?;
+    let root = TempDir::new()?;
+    let final_query = burst_query(BURST_COUNT - 1)[..PREFIX_COUNT].to_string();
+    for index in 0..FILE_COUNT {
+        std::fs::write(
+            root.path().join(format!("{final_query}-{index:05}.txt")),
+            "contents",
+        )?;
+    }
+    let mut mcp = initialized_mcp(&codex_home).await?;
+
+    let session_id = "session-burst";
+    mcp.start_fuzzy_file_search_session(
+        session_id,
+        vec![root.path().to_string_lossy().to_string()],
+    )
+    .await?;
+
+    let mut request_ids = Vec::with_capacity(BURST_COUNT * PREFIX_COUNT);
+    for burst in 0..BURST_COUNT {
+        let query = burst_query(burst);
+        for prefix_len in 1..=PREFIX_COUNT {
+            request_ids.push(
+                mcp.send_fuzzy_file_search_session_update_request(session_id, &query[..prefix_len])
+                    .await?,
+            );
+        }
+    }
+    for request_id in request_ids {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+    }
+
+    let update = wait_for_session_updated(
+        &mut mcp,
+        session_id,
+        &final_query,
+        FileExpectation::NonEmpty,
+    )
+    .await?;
+    assert_eq!(update.query, final_query);
+    for _ in 0..BURST_COUNT * PREFIX_COUNT {
+        let completed = wait_for_session_completed(&mut mcp, session_id).await?;
+        assert_eq!(completed.session_id, session_id);
+    }
+
+    Ok(())
+}
+
+fn burst_query(burst: usize) -> String {
+    format!("burst-{burst:02}-current-query-result-abcdef")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fuzzy_file_search_session_update_after_stop_fails() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;

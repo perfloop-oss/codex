@@ -96,16 +96,20 @@ pub(crate) struct FuzzyFileSearchSession {
 }
 
 impl FuzzyFileSearchSession {
-    pub(crate) fn update_query(&self, query: String) {
+    pub(crate) fn update_query(&self, query: String) -> anyhow::Result<()> {
         if self.shared.canceled.load(Ordering::Relaxed) {
-            return;
+            anyhow::bail!("fuzzy file search session is cancelled");
         }
-        {
-            #[expect(clippy::unwrap_used)]
-            let mut latest_query = self.shared.latest_query.lock().unwrap();
-            *latest_query = query.clone();
+
+        #[expect(clippy::unwrap_used)]
+        let mut latest_query = self.shared.latest_query.lock().unwrap();
+        let previous_query = std::mem::replace(&mut *latest_query, query.clone());
+        if let Err(err) = self.session.update_query(&query) {
+            *latest_query = previous_query;
+            return Err(err);
         }
-        self.session.update_query(&query);
+
+        Ok(())
     }
 }
 
@@ -197,22 +201,33 @@ impl SessionReporterImpl {
             },
         );
         let outgoing = self.shared.outgoing.clone();
+        let canceled = self.shared.canceled.clone();
         self.shared.runtime.spawn(async move {
-            outgoing.send_server_notification(notification).await;
+            if !canceled.load(Ordering::Relaxed) {
+                outgoing.send_server_notification(notification).await;
+            }
         });
     }
 
-    fn send_complete(&self) {
+    fn send_complete(&self, completed_query_count: usize) {
         if self.shared.canceled.load(Ordering::Relaxed) {
             return;
         }
         let session_id = self.shared.session_id.clone();
         let outgoing = self.shared.outgoing.clone();
+        let canceled = self.shared.canceled.clone();
         self.shared.runtime.spawn(async move {
-            let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
-                FuzzyFileSearchSessionCompletedNotification { session_id },
-            );
-            outgoing.send_server_notification(notification).await;
+            for _ in 0..completed_query_count.max(1) {
+                if canceled.load(Ordering::Relaxed) {
+                    return;
+                }
+                let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
+                    FuzzyFileSearchSessionCompletedNotification {
+                        session_id: session_id.clone(),
+                    },
+                );
+                outgoing.send_server_notification(notification).await;
+            }
         });
     }
 }
@@ -222,8 +237,8 @@ impl file_search::SessionReporter for SessionReporterImpl {
         self.send_snapshot(snapshot);
     }
 
-    fn on_complete(&self) {
-        self.send_complete();
+    fn on_complete(&self, completed_query_count: usize) {
+        self.send_complete(completed_query_count);
     }
 }
 

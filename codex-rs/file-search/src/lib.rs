@@ -35,8 +35,15 @@ use nucleo::pattern::AtomKind;
 use nucleo::pattern::Pattern;
 
 mod cli;
+mod query_mailbox;
+
+#[cfg(test)]
+#[path = "query_mailbox_tests.rs"]
+mod query_mailbox_tests;
 
 pub use cli::Cli;
+
+use query_mailbox::QueryMailbox;
 
 /// A single match result returned from the search.
 ///
@@ -136,8 +143,12 @@ pub trait SessionReporter: Send + Sync + 'static {
     /// Called when the debounced top-N changes.
     fn on_update(&self, snapshot: &FileSearchSnapshot);
 
-    /// Called when the session becomes idle or is cancelled. Guaranteed to be called at least once per update_query.
-    fn on_complete(&self);
+    /// Called when the session becomes idle or is cancelled.
+    ///
+    /// `completed_query_count` is the number of accepted [`FileSearchSession::update_query`]
+    /// calls covered by this completion. It may be zero when a session is cancelled before its
+    /// first query. Coalesced updates are counted so callers do not lose completion information.
+    fn on_complete(&self, completed_query_count: usize);
 }
 
 pub struct FileSearchSession {
@@ -146,17 +157,18 @@ pub struct FileSearchSession {
 
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
-    pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
-            .inner
-            .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+    pub fn update_query(&self, pattern_text: &str) -> anyhow::Result<()> {
+        self.inner
+            .query_mailbox
+            .update(pattern_text)
+            .map_err(|_| anyhow::anyhow!("file search session is closed"))
     }
 }
 
 impl Drop for FileSearchSession {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Relaxed);
+        self.inner.query_mailbox.close();
         let _ = self.inner.work_tx.send(WorkSignal::Shutdown);
     }
 }
@@ -180,6 +192,7 @@ pub fn create_session(
     };
     let override_matcher = build_override_matcher(primary_search_directory, &exclude)?;
     let (work_tx, work_rx) = unbounded();
+    let (query_mailbox, query_wake_rx) = QueryMailbox::new();
 
     let notify_tx = work_tx.clone();
     let notify = Arc::new(move || {
@@ -205,10 +218,11 @@ pub fn create_session(
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
         work_tx,
+        query_mailbox,
     });
 
     let matcher_inner = inner.clone();
-    thread::spawn(move || matcher_worker(matcher_inner, work_rx, nucleo));
+    thread::spawn(move || matcher_worker(matcher_inner, work_rx, query_wake_rx, nucleo));
 
     let walker_inner = inner.clone();
     thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
@@ -303,7 +317,7 @@ pub fn run(
     let reporter = Arc::new(RunReporter::default());
     let session = create_session(roots, options, reporter.clone(), cancel_flag)?;
 
-    session.update_query(pattern_text);
+    session.update_query(pattern_text)?;
 
     let snapshot = reporter.wait_for_complete();
     Ok(FileSearchResults {
@@ -358,10 +372,10 @@ struct SessionInner {
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
+    query_mailbox: QueryMailbox,
 }
 
 enum WorkSignal {
-    QueryUpdated(String),
     NucleoNotify,
     WalkComplete,
     Shutdown,
@@ -499,6 +513,7 @@ fn walker_worker(
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
+    query_wake_rx: Receiver<()>,
     mut nucleo: Nucleo<IndexedEntry>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
@@ -511,27 +526,36 @@ fn matcher_worker(
     let mut next_notify = never();
     let mut will_notify = false;
     let mut walk_complete = false;
+    let mut completed_query_count = 0_usize;
+    let mut needs_completion = true;
 
     loop {
         select! {
+            recv(query_wake_rx) -> wake => {
+                let Ok(()) = wake else {
+                    break;
+                };
+                if let Some(pending) = inner.query_mailbox.take() {
+                    let append = pending.query.starts_with(&last_query);
+                    nucleo.pattern.reparse(
+                        0,
+                        &pending.query,
+                        CaseMatching::Ignore,
+                        Normalization::Smart,
+                        append,
+                    );
+                    last_query = pending.query;
+                    completed_query_count = completed_query_count.saturating_add(pending.update_count);
+                    needs_completion = true;
+                    will_notify = true;
+                    next_notify = after(Duration::from_millis(0));
+                }
+            }
             recv(work_rx) -> signal => {
                 let Ok(signal) = signal else {
                     break;
                 };
                 match signal {
-                    WorkSignal::QueryUpdated(query) => {
-                        let append = query.starts_with(&last_query);
-                        nucleo.pattern.reparse(
-                            0,
-                            &query,
-                            CaseMatching::Ignore,
-                            Normalization::Smart,
-                            append,
-                        );
-                        last_query = query;
-                        will_notify = true;
-                        next_notify = after(Duration::from_millis(0));
-                    }
                     WorkSignal::NucleoNotify => {
                         if !will_notify {
                             will_notify = true;
@@ -594,8 +618,9 @@ fn matcher_worker(
                     };
                     inner.reporter.on_update(&snapshot);
                 }
-                if !status.running && walk_complete {
-                    inner.reporter.on_complete();
+                if !status.running && walk_complete && completed_query_count > 0 {
+                    inner.reporter.on_complete(std::mem::take(&mut completed_query_count));
+                    needs_completion = false;
                 }
             }
             default(Duration::from_millis(100)) => {
@@ -608,8 +633,13 @@ fn matcher_worker(
         }
     }
 
-    // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
-    inner.reporter.on_complete();
+    inner.query_mailbox.close();
+    if let Some(pending) = inner.query_mailbox.take() {
+        completed_query_count = completed_query_count.saturating_add(pending.update_count);
+    }
+    if needs_completion || completed_query_count > 0 {
+        inner.reporter.on_complete(completed_query_count);
+    }
 
     Ok(())
 }
@@ -627,7 +657,7 @@ impl SessionReporter for RunReporter {
         *guard = snapshot.clone();
     }
 
-    fn on_complete(&self) {
+    fn on_complete(&self, _completed_query_count: usize) {
         let (cv, mutex) = &self.completed;
         #[allow(clippy::unwrap_used)]
         let mut completed = mutex.lock().unwrap();
@@ -786,7 +816,7 @@ mod tests {
             self.update_cv.notify_all();
         }
 
-        fn on_complete(&self) {
+        fn on_complete(&self, _completed_query_count: usize) {
             {
                 let mut complete_times = self.complete_times.lock().unwrap();
                 complete_times.push(Instant::now());
@@ -816,10 +846,10 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("file-00");
+        session.update_query("file-00").expect("query accepted");
         thread::sleep(Duration::from_millis(20));
         let first_snapshot = reporter.snapshot();
-        session.update_query("file-01");
+        session.update_query("file-01").expect("query accepted");
         thread::sleep(Duration::from_millis(20));
         let second_snapshot = reporter.snapshot();
         let _ = reporter.wait_for_complete(Duration::from_secs(5));
@@ -841,7 +871,7 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("file-0");
+        session.update_query("file-0").expect("query accepted");
         let completed = reporter.wait_for_complete(Duration::from_secs(5));
 
         assert!(completed);
@@ -863,11 +893,11 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("alpha");
+        session.update_query("alpha").expect("query accepted");
         assert!(reporter.wait_for_complete(Duration::from_secs(5)));
         let updates_before = reporter.updates().len();
 
-        session.update_query("beta");
+        session.update_query("beta").expect("query accepted");
         assert!(reporter.wait_for_updates_at_least(updates_before + 1, Duration::from_secs(5),));
 
         let updates = reporter.updates();
@@ -894,7 +924,7 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("asdf");
+        session.update_query("asdf").expect("query accepted");
         assert!(reporter.wait_for_complete(Duration::from_secs(5)));
 
         let completed_snapshot = reporter.snapshot();
@@ -903,7 +933,7 @@ mod tests {
 
         reporter.clear();
 
-        session.update_query("asdfa");
+        session.update_query("asdfa").expect("query accepted");
         assert!(reporter.wait_for_complete(Duration::from_secs(5)));
         assert!(!reporter.updates().is_empty());
     }
@@ -932,8 +962,8 @@ mod tests {
         )
         .expect("session_b");
 
-        session_a.update_query("file-0");
-        session_b.update_query("file-1");
+        session_a.update_query("file-0").expect("query accepted");
+        session_b.update_query("file-1").expect("query accepted");
 
         thread::sleep(Duration::from_millis(5));
         drop(session_a);
@@ -954,13 +984,13 @@ mod tests {
         )
         .expect("session");
 
-        session.update_query("zzzzzzzz");
+        session.update_query("zzzzzzzz").expect("query accepted");
         let completed = reporter.wait_for_complete(Duration::from_secs(5));
         assert!(completed);
 
         reporter.clear();
 
-        session.update_query("zzzzzzzzq");
+        session.update_query("zzzzzzzzq").expect("query accepted");
         let completed = reporter.wait_for_complete(Duration::from_secs(5));
         assert!(completed);
 

@@ -67,8 +67,10 @@ impl FileSearchManager {
         if st.session.is_none() {
             self.start_session_locked(&mut st);
         }
-        if let Some(session) = st.session.as_ref() {
-            session.update_query(&query);
+        if let Some(session) = st.session.as_ref()
+            && let Err(err) = session.update_query(&query)
+        {
+            tracing::warn!("file search session failed to update: {err}");
         }
     }
 
@@ -112,6 +114,7 @@ impl TuiSessionReporter {
         if st.session_token != self.session_token
             || st.latest_query.is_empty()
             || snapshot.query.is_empty()
+            || snapshot.query != st.latest_query
         {
             return;
         }
@@ -129,5 +132,9 @@ impl file_search::SessionReporter for TuiSessionReporter {
         self.send_snapshot(snapshot);
     }
 
-    fn on_complete(&self) {}
+    fn on_complete(&self, _completed_query_count: usize) {}
 }
+
+#[cfg(test)]
+#[path = "file_search_tests.rs"]
+mod tests;

@@ -301,6 +301,10 @@ Example with notification opt-out:
 enabled layer of the operation's loaded config stack. Otherwise it removes the
 snapshot and any base-user entry; a base-user entry is not required for cleanup.
 
+### Fuzzy file search sessions
+
+The experimental `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop` methods maintain a search session. `sessionUpdate` accepts a new query without waiting for matching; pending intermediate queries may be coalesced, and `fuzzyFileSearch/sessionUpdated` identifies the query in each result. `fuzzyFileSearch/sessionCompleted` contains only `sessionId`; it can cover one or more accepted updates and does not identify a query. Clients must use the query in `sessionUpdated` rather than treating completion as the result for a particular update. `fuzzyFileSearch/sessionStop` removes the session and cancels future notification delivery, so an accepted update may receive no notification after the session is stopped.
+
 ### Example: Start or resume a thread
 
 Start a fresh thread when you need a new Codex conversation.
@@ -1645,10 +1649,10 @@ Examples:
 
 ### Fuzzy file search events (experimental)
 
-The fuzzy file search session API emits per-query notifications:
+The fuzzy file search session API emits notifications for matching snapshots and completion:
 
-- `fuzzyFileSearch/sessionUpdated` — `{ sessionId, query, files }` with the current matching files for the active query.
-- `fuzzyFileSearch/sessionCompleted` — `{ sessionId, query }` once indexing/matching for that query has completed.
+- `fuzzyFileSearch/sessionUpdated` — `{ sessionId, query, files }` with matching files for a query. Intermediate queries may be coalesced, so use the notification's `query` to identify the snapshot.
+- `fuzzyFileSearch/sessionCompleted` — `{ sessionId }` after pending matching work completes. One notification may cover one or more accepted updates and does not identify a query.
 
 ### Thread realtime events (experimental)
 

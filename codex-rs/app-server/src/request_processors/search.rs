@@ -104,22 +104,21 @@ impl SearchRequestProcessor {
         params: FuzzyFileSearchSessionUpdateParams,
     ) -> Result<FuzzyFileSearchSessionUpdateResponse, JSONRPCErrorError> {
         let FuzzyFileSearchSessionUpdateParams { session_id, query } = params;
-        let found = {
+        let update_result = {
             let sessions = self.fuzzy_search_sessions.lock().await;
-            if let Some(session) = sessions.get(&session_id) {
-                session.update_query(query);
-                true
-            } else {
-                false
-            }
+            sessions
+                .get(&session_id)
+                .map(|session| session.update_query(query))
         };
-        if !found {
-            return Err(invalid_request(format!(
+        match update_result {
+            Some(Ok(())) => Ok(FuzzyFileSearchSessionUpdateResponse {}),
+            Some(Err(err)) => Err(internal_error(format!(
+                "failed to update fuzzy file search session: {err}"
+            ))),
+            None => Err(invalid_request(format!(
                 "fuzzy file search session not found: {session_id}"
-            )));
+            ))),
         }
-
-        Ok(FuzzyFileSearchSessionUpdateResponse {})
     }
 
     pub(crate) async fn fuzzy_file_search_session_stop(

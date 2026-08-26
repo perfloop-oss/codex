@@ -1,6 +1,16 @@
 load("//:defs.bzl", "codex_rust_crate")
+load("//bazel/rules:e2e_benchmark.bzl", "codex_e2e_benchmark")
 
 codex_rust_crate(
     name = "file-search",
     crate_name = "codex_file_search",
+)
+
+codex_e2e_benchmark(
+    name = "file-search-query-coalescing",
+    srcs_extra = ["//codex-rs/tui:src/file_search.rs"],
+    deps = [
+        ":file-search",
+        "@crates//:tracing",
+    ],
 )

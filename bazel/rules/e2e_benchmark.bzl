@@ -4,7 +4,7 @@ load("//:defs.bzl", "workspace_root_test")
 
 _WORKSPACE_ROOT_MARKER = "//codex-rs/utils/cargo-bin:repo_root.marker"
 
-def codex_e2e_benchmark(name, binaries = [], data = [], deps = []):
+def codex_e2e_benchmark(name, binaries = [], data = [], deps = [], srcs_extra = []):
     """Defines a Bazel-only Divan end-to-end benchmark.
 
     The benchmark source lives at `e2e_benches/<name>.rs`, with hyphens in
@@ -16,6 +16,7 @@ def codex_e2e_benchmark(name, binaries = [], data = [], deps = []):
         binaries: Runtime executable labels that the benchmark spawns.
         data: Additional runtime files needed by the benchmark.
         deps: Additional Rust dependencies beyond the crate's Cargo deps.
+        srcs_extra: Additional Rust source files used by the benchmark crate.
     """
     benchmark_name = name.replace("-", "_")
     source = "e2e_benches/{}.rs".format(benchmark_name)
@@ -28,7 +29,7 @@ def codex_e2e_benchmark(name, binaries = [], data = [], deps = []):
     rust_binary(
         name = binary_name,
         testonly = True,
-        srcs = [source],
+        srcs = [source] + srcs_extra,
         crate_name = benchmark_name + "_bench",
         crate_root = source,
         deps = all_crate_deps(

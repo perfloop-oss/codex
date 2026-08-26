@@ -28,3 +28,10 @@ codex_rust_crate(
         "tui-unit-tests": 8,
     },
 )
+
+exports_files(
+    [
+        "src/file_search.rs",
+    ],
+    visibility = ["//codex-rs/file-search:__pkg__"],
+)

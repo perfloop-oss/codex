@@ -21,6 +21,7 @@ test_suite(
     tags = ["manual"],
     tests = [
         "//codex-rs/cli:codex-help-bench",
+        "//codex-rs/file-search:file-search-query-coalescing-bench",
     ],
     visibility = ["//visibility:public"],
 )
